@@ -1,0 +1,91 @@
+# Phase 3 sparse-vs-dense routing experiment on the Phase 2 heterogeneous task.
+# Data generation, splits, planted corrections and the frozen W0 are IDENTICAL to
+# configs/dense_molora.yaml (same `data` block, same seeds, same make_problem()).
+experiment:
+  name: sparse_molora_synthetic
+  output_dir: outputs
+  seeds: [42, 43, 44]
+  repeat_first_seed: true
+
+seed: 42
+device: cpu
+dtype: float32
+
+data:
+  input_dim: 128
+  output_dim: 128
+  n_regimes: 4
+  indicator_dims: 4
+  regime_rank: 8
+  delta_rel_norm: 0.5
+  noise_std: 0.0
+  n_train: 8192
+  n_val: 1024
+  n_test: 1024
+  bias: false
+
+model:
+  n_experts: 4
+  rank: 8
+  alpha: 16.0
+  router_temperature: 1.0
+  router_init: xavier
+  b_init_std: 0.0
+  execution_mode: dispatch        # genuine sparse execution; reference mode is verified equal in tests
+
+baselines:
+  single_lora_rank: 8
+  matched_lora_rank: 34
+
+# Methods evaluated in the confirmatory run. top1 uses the router-gradient
+# mode chosen by the pilot (exact renormalised top-1 gives the router NO task
+# gradient; straight-through is a surrogate, not an exact derivative).
+methods:
+  frozen: {}
+  single_lora: {}
+  matched_lora: {}
+  dense_molora: {}
+  sparse_top1: {top_k: 1, router_grad_mode: straight_through}
+  sparse_top2: {top_k: 2, router_grad_mode: renormalized}
+  sparse_top4: {top_k: 4, router_grad_mode: renormalized}
+
+training:
+  optimizer: adam
+  batch_size: 32
+  max_steps: 2000
+  eval_every: 100
+  # Learning rates: single/matched/dense carried over from the Phase 2 pilot;
+  # sparse_* chosen by the Phase 3 pilot (seed 42, VALIDATION only, candidates
+  # 1e-3 / 3e-3 / 1e-2; outputs/sparse_molora_synthetic_pilot/20261108-163043):
+  #   sparse_top1 renormalized      val MSE 0.4262 / 0.4279 / 0.4547  (router never learns)
+  #   sparse_top1 straight_through  val MSE 9.35e-2 / 1.53e-13 / 5.51e-3 -> straight_through, 3e-3
+  #   sparse_top2                   val MSE 4.02e-3 / 3.89e-4 / 1.41e-2 -> 3e-3
+  #   sparse_top4                   val MSE 5.93e-3 / 5.44e-4 / 2.55e-2 -> 3e-3
+  learning_rate:
+    single_lora: 0.001
+    matched_lora: 0.001
+    dense_molora: 0.003
+    sparse_top1: 0.003
+    sparse_top2: 0.003
+    sparse_top4: 0.003
+
+pilot:
+  seed: 42
+  learning_rates: [0.001, 0.003, 0.01]
+  top1_router_grad_modes: [renormalized, straight_through]
+
+diagnostics:
+  track_every: 100
+
+# Pre-registered before the confirmatory run.
+success_criteria:
+  # sparse top-2 must be "comparable" to dense: test MSE within 2x of dense MoLoRA on every seed
+  max_test_mse_ratio_top2_vs_dense: 2.0
+  # and far below the parameter-matched single LoRA
+  max_test_mse_ratio_top2_vs_matched_lora: 0.1
+  # sparse top-4 must reproduce dense MoLoRA closely (same function, same lr)
+  max_test_mse_ratio_top4_vs_dense: 1.5
+  # measured adapter FLOP fraction must equal k / E for every sparse method
+  require_flop_fraction_equals_k_over_E: true
+  require_frozen_backbone_unchanged: true
+  reproducibility_rtol: 1.0e-6

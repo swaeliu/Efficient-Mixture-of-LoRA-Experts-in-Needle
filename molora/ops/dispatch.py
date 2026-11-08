@@ -56,13 +56,23 @@ class GatherRows(TensorOp):
 
 
 class ScatterAddRows(TensorOp):
-    """``out[idx_j[m]] += y_j[m]`` over all inputs ``y_j``; output has ``n_rows`` rows."""
+    """``out[idx_j[m]] += y_j[m]`` over all inputs ``y_j``; output has ``n_rows`` rows.
 
-    def __init__(self, index_list: Sequence, n_rows: int) -> None:
+    ``assume_unique=True`` promises that the indices *within each* ``idx_j`` are
+    distinct (true for token-to-expert dispatch: a token selects an expert at
+    most once). The op then uses buffered fancy-index addition, which is an
+    order of magnitude faster than the unbuffered ``np.add.at`` needed for
+    repeated indices. Indices may still repeat *across* inputs; those sums are
+    applied sequentially and remain exact. With ``assume_unique=False`` (default)
+    ``np.add.at`` is used and arbitrary repeats are supported.
+    """
+
+    def __init__(self, index_list: Sequence, n_rows: int, assume_unique: bool = False) -> None:
         self.index_list = [_as_index(i, f"index_list[{j}]") for j, i in enumerate(index_list)]
         if isinstance(n_rows, bool) or not isinstance(n_rows, (int, np.integer)) or n_rows < 0:
             raise ValueError(f"n_rows must be a non-negative int, got {n_rows!r}")
         self.n_rows = int(n_rows)
+        self.assume_unique = bool(assume_unique)
 
     def compute(self, *arrays):
         if len(arrays) != len(self.index_list):
@@ -76,7 +86,10 @@ class ScatterAddRows(TensorOp):
                 raise ValueError(f"input of shape {a.shape} does not match {idx.shape[0]} indices with width {d}")
             if idx.size and (idx.min() < 0 or idx.max() >= self.n_rows):
                 raise IndexError(f"scatter_add_rows index out of range for {self.n_rows} rows")
-            np.add.at(out, idx, a)  # repeated indices accumulate
+            if self.assume_unique:
+                out[idx] += a  # exact when idx has no repeats (dispatch guarantees this)
+            else:
+                np.add.at(out, idx, a)  # repeated indices accumulate
         return out
 
     def gradient(self, out_grad: Tensor, node: Tensor):
@@ -88,8 +101,12 @@ def gather_rows(x: Tensor, idx) -> Tensor:
     return GatherRows(idx)(x)
 
 
-def scatter_add_rows(tensors: Sequence[Tensor], index_list: Sequence, n_rows: int) -> Tensor:
-    """Differentiable multi-input row scatter-add into an ``(n_rows, D)`` output."""
+def scatter_add_rows(tensors: Sequence[Tensor], index_list: Sequence, n_rows: int, *,
+                     assume_unique: bool = False) -> Tensor:
+    """Differentiable multi-input row scatter-add into an ``(n_rows, D)`` output.
+
+    Pass ``assume_unique=True`` only if every ``index_list[j]`` has no repeated entries.
+    """
     if len(tensors) != len(index_list):
         raise ValueError("tensors and index_list must have the same length")
-    return ScatterAddRows(index_list, n_rows)(*tensors)
+    return ScatterAddRows(index_list, n_rows, assume_unique=assume_unique)(*tensors)

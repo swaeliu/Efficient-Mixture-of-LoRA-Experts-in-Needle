@@ -129,7 +129,8 @@ class SparseMoLoRALinear(DenseMoLoRALinear):
             executed.append(int(tok.size))
         t0 = time.perf_counter() if self.profile else 0.0
         if contribs:
-            out = out + scatter_add_rows(contribs, idx_list, n_tokens)
+            # each token selects an expert at most once, so indices are unique within each expert
+            out = out + scatter_add_rows(contribs, idx_list, n_tokens, assume_unique=True)
         if self.profile:
             self._timing_acc["dispatch_s"] += t_gather + (time.perf_counter() - t0)
             self._timing_acc["expert_s"] += t_expert

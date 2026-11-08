@@ -83,6 +83,20 @@ def test_empty_gather_and_scatter_input_errors():
         scatter_add_rows([x], [np.array([0, 1, 2]), np.array([0])], 3)
 
 
+def test_scatter_assume_unique_fast_path_matches_add_at():
+    rng = np.random.default_rng(3)
+    y1, y2 = rng.standard_normal((4, 3)), rng.standard_normal((3, 3))
+    i1, i2 = np.array([5, 0, 2, 7]), np.array([0, 5, 1])  # unique within each input, repeated across inputs
+    slow = scatter_add_rows([_t(y1), _t(y2)], [i1, i2], 8).numpy()
+    fast_t1, fast_t2 = _t(y1, requires_grad=True), _t(y2, requires_grad=True)
+    fast = scatter_add_rows([fast_t1, fast_t2], [i1, i2], 8, assume_unique=True)
+    np.testing.assert_allclose(fast.numpy(), slow, rtol=1e-15, atol=1e-15)
+    up = rng.standard_normal((8, 3))
+    (fast * _t(up)).sum().backward()
+    np.testing.assert_array_equal(fast_t1.grad.numpy(), up[i1])
+    np.testing.assert_array_equal(fast_t2.grad.numpy(), up[i2])
+
+
 def test_scatter_float32_dtype_preserved():
     out = scatter_add_rows([_t(np.ones((2, 2), np.float32), dtype="float32")], [np.array([1, 1])], 3)
     assert out.dtype == np.float32
