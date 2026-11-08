@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molora"
+version = "0.1.0"
+description = "Efficient Mixture-of-LoRA Experts in Needle: native LoRA adapters built on the 10-714 Needle framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "matplotlib>=3.7",
+]
+
+# Needle itself is NOT a PyPI dependency. It is the user's completed 10-714
+# coursework implementation and is linked into the environment by
+# scripts/link_needle.py (writes a .pth file) or by the NEEDLE_PYTHON_DIR
+# environment variable. See docs/needle_environment.md.
+
+[tool.setuptools.packages.find]
+include = ["molora*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = ["error::DeprecationWarning:molora.*"]

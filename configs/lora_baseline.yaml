@@ -1,0 +1,41 @@
+# Phase 1 synthetic low-rank regression benchmark (Task 1.9).
+# Success criteria are fixed here BEFORE the confirmatory run (Task 1.11).
+experiment:
+  name: lora_synthetic
+  output_dir: outputs          # git-ignored; a run writes outputs/<name>/<timestamp>/
+  seeds: [42, 43, 44]          # every seed is run; `seed` below is the primary one
+  repeat_first_seed: true      # rerun the first seed to check reproducibility
+
+seed: 42
+device: cpu
+dtype: float32
+
+model:
+  input_dim: 128
+  output_dim: 128
+  lora_rank: 8
+  lora_alpha: 16.0
+  bias: false
+
+data:
+  n_train: 4096
+  n_val: 1024
+  target_rank: 8               # rank of the true correction ΔW* = A* B*  (<= lora_rank)
+  delta_rel_norm: 0.5          # ||ΔW*||_F = delta_rel_norm * ||W0||_F  (keeps the target well scaled)
+  noise_std: 0.0               # additive Gaussian noise on y (0 => achievable MSE is ~0)
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  optimizer: adam
+  max_steps: 1000
+  eval_every: 50
+
+success_criteria:
+  # LoRA validation MSE must be at most this fraction of the frozen-backbone
+  # baseline validation MSE, on EVERY seed (i.e. >= 90% reduction).
+  max_val_mse_ratio: 0.10
+  # final training loss must be below the initial training loss on every seed
+  require_train_loss_decrease: true
+  # reruns of the same seed must agree on final validation loss to this rtol
+  reproducibility_rtol: 1.0e-6
