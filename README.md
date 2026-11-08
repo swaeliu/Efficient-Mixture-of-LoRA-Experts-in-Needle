@@ -16,7 +16,7 @@ budget, and at what computational cost? The planned comparison is
 
 1. single-adapter LoRA (**implemented, Phase 1**),
 2. dense Mixture-of-LoRA experts (**implemented, Phase 2**),
-3. sparse Mixture-of-LoRA experts with top-k routing (Phase 3),
+3. sparse Mixture-of-LoRA experts with top-k routing (**implemented, Phase 3**),
 4. optionally, quantised frozen backbone weights in the spirit of QLoRA (Phase 4).
 
 ## Status
@@ -26,7 +26,7 @@ budget, and at what computational cost? The planned comparison is
 | 0 | Environment, Needle integration, framework verification | **complete** ([docs/needle_environment.md](docs/needle_environment.md)) |
 | 1 | Native `LoRALinear`, forward/backward/freezing tests, synthetic low-rank benchmark | **complete** ([docs/phase1_validation.md](docs/phase1_validation.md)) |
 | 2 | Dense Mixture-of-LoRA (`DenseMoLoRALinear`, softmax router, heterogeneous routing benchmark, CPU overhead benchmark) | **complete** ([docs/phase2_validation.md](docs/phase2_validation.md)) |
-| 3 | Sparse top-k routing, load balancing, efficiency measurements | planned |
+| 3 | Sparse top-k routing (`SparseMoLoRALinear`, reference + genuine token dispatch), straight-through top-1, sparse-vs-dense benchmark | **complete** ([docs/phase3_design.md](docs/phase3_design.md), [docs/phase3_validation.md](docs/phase3_validation.md)) |
 | 4 | Quantised frozen backbone (QLoRA-style), optional | planned |
 
 Everything under "planned" does not exist in this repository yet.
@@ -85,6 +85,34 @@ x = ndl.Tensor(np.random.randn(32, 128).astype(np.float32), dtype="float32", req
 y, gates = moe.forward_with_routing(x)                        # gates: (32, 4), rows sum to 1
 ```
 
+`molora/sparse_molora.py`, `molora/sparse_router.py` and `molora/ops/` (Phase 3)
+provide `SparseMoLoRALinear`, a top-k sparse mixture on the same frozen backbone:
+
+    y = x W0 + b + Σ_{i ∈ TopK(g(x), k)} g̃_i(x) · (alpha / r) · x A_i B_i,    g̃_i = g_i / Σ_{j ∈ TopK} g_j
+
+* `molora.ops.topk`: deterministic top-k selection (NumPy metadata, ties →
+  lower index) and renormalised sparse gates built from Needle ops. The exact
+  gradient flows through the selected probabilities with the selection fixed;
+  for `k = 1` that gradient is identically zero, so an optional straight-through
+  surrogate (`router_grad_mode="straight_through"`) is provided and labelled as
+  an estimator, not a derivative.
+* `molora.ops.dispatch`: `gather_rows` / `scatter_add_rows` Needle `TensorOp`s
+  (mutually adjoint; repeated indices accumulate) — Needle has no indexing op.
+* `execution_mode="reference"` runs every expert and applies the sparse weights
+  (trusted baseline); `execution_mode="dispatch"` gathers each expert's tokens,
+  runs only selected experts on only their tokens and scatter-adds the results;
+  experts with no tokens are skipped. Both modes are verified equal to 1e-11
+  (float64) for outputs and all gradients. `last_stats` reports tokens per
+  expert, matmuls executed, experts skipped and adapter FLOPs vs dense (= k/E).
+* `k = E` reproduces `DenseMoLoRALinear`; `E = 1, k = 1` reproduces `LoRALinear`.
+
+```python
+from molora import SparseMoLoRALinear
+sp = SparseMoLoRALinear.from_linear(base, n_experts=4, rank=8, alpha=16.0, top_k=2, execution_mode="dispatch")
+y, sparse_weights = sp.forward_with_routing(x)   # weights: (…, 4), exactly 2 non-zeros per row summing to 1
+print(sp.last_stats["expert_flop_fraction_vs_dense"])  # 0.5
+```
+
 ## Setup
 
 Requirements: Python ≥ 3.10 (3.13 tested), a C compiler is **not** needed, no
@@ -119,7 +147,7 @@ python scripts/link_needle.py /path/to/needle/python
 
 ```bash
 source .venv/bin/activate
-python -m pytest            # 176 tests (79 Phase 1 + 97 Phase 2), < 1 s on CPU
+python -m pytest            # 353 tests (79 Phase 1 + 97 Phase 2 + 177 Phase 3), < 1 s on CPU
 python experiments/smoke_test.py
 ```
 
@@ -133,6 +161,12 @@ python experiments/smoke_test.py
 | `tests/test_dense_molora_forward.py` | 2-D/3-D shapes, gate normalisation, initial equivalence to the backbone, `from_linear`, independent NumPy oracle, one-expert = `LoRALinear`, accounting, invalid configs |
 | `tests/test_dense_molora_backward.py` | finite differences for every `A_i`, `B_i`, router weight/bias and input; zero-init gradient structure; identical experts ⇒ zero router gradient |
 | `tests/test_dense_molora_training.py` | backbone bit-identical over Adam/SGD steps, experts and router move, optimizer list excludes backbone, stacked model, determinism |
+| `tests/test_topk.py` | top-k membership/order on 1–4-D inputs, deterministic ties, exactly-k masks, renormalised gates vs NumPy, FD gradient, k=1 constant, straight-through |
+| `tests/test_sparse_router.py` | masked router vs NumPy, k=E equals dense router, one-hot top-1, FD gradients, top-1 exact vs straight-through |
+| `tests/test_sparse_molora_forward.py` | shapes, exactly k selected, NumPy oracle, k=E = dense, E=1/k=1 = LoRALinear, accounting, ties, invalid configs |
+| `tests/test_sparse_molora_backward.py` | FD for all experts / router / input away from selection boundaries, per-token gradient attribution, never-selected expert, top-1 modes |
+| `tests/test_sparse_dispatch.py` | gather/scatter forward+backward with repeats, adjointness, reference = dispatch (outputs, all gradients, Adam trajectories), expert skipping, FLOP accounting |
+| `tests/test_sparse_training.py` | backbone frozen in both modes, experts/router move, top-1 exact vs STE, identical trajectories across modes, determinism, balance loss |
 
 ## Running the synthetic experiment
 
@@ -188,25 +222,49 @@ outputs/benchmark_dense_molora/<timestamp>/benchmark.{json,md}
 
 Measured results and figures are in [docs/phase2_validation.md](docs/phase2_validation.md).
 
+## Running the Phase 3 sparse-vs-dense experiments
+
+```bash
+python experiments/train_sparse_molora.py --pilot          # LR + top-1 router-grad-mode sweep, validation only
+python experiments/train_sparse_molora.py                  # confirmatory run (test data): frozen, LoRA r=8/r=34, dense, sparse top-1/2/4
+python experiments/train_sparse_molora.py --sweep experts  # E=8, k in {1,2,4,8}
+python experiments/train_sparse_molora.py --sweep rank     # top-2 with ranks 4/8/16
+python experiments/benchmark_sparse_molora.py              # pinned-thread forward/backward/step latency, memory, FLOP accounting
+```
+
+Outputs go to `outputs/sparse_molora_synthetic*/<timestamp>/` (`results.json`,
+`summary.md`, `loss_curves.png`, `accuracy_vs_k.png`,
+`routing_selection_heatmap.png`) and `outputs/benchmark_sparse_molora/<timestamp>/`
+(`benchmark.{json,md}`, `latency_memory_vs_k.png`). Headline (CPU, 1 BLAS
+thread, see [docs/phase3_validation.md](docs/phase3_validation.md)): sparse top-2
+matches or beats dense MoLoRA on the 4-regime task with exactly half the
+adapter FLOPs and about two-thirds of the per-step memory, but is only faster in
+wall-clock time for small k at ≳ 512 tokens; at small batches dispatch overhead
+makes it slower than dense. Top-1 needs the straight-through surrogate to train
+its router.
+
 ## Repository layout
 
 ```
 molora/            needle_compat.py (locates Needle), lora.py (LoRALinear),
-                   router.py (DenseSoftmaxRouter, softmax), dense_molora.py (LoRAExpert, DenseMoLoRALinear)
-tests/             pytest suite (Phases 0-2)
-experiments/       smoke_test.py, train_synthetic.py, train_dense_molora.py, benchmark_dense_molora.py
-configs/           lora_baseline.yaml, dense_molora.yaml
+                   router.py (DenseSoftmaxRouter, softmax), dense_molora.py (LoRAExpert, DenseMoLoRALinear),
+                   sparse_router.py (SparseTopKRouter), sparse_molora.py (SparseMoLoRALinear, load_balance_loss),
+                   ops/topk.py (top-k selection, sparse gates), ops/dispatch.py (gather_rows, scatter_add_rows)
+tests/             pytest suite (Phases 0-3)
+experiments/       smoke_test.py, train_synthetic.py, train_dense_molora.py, benchmark_dense_molora.py,
+                   train_sparse_molora.py, benchmark_sparse_molora.py
+configs/           lora_baseline.yaml, dense_molora.yaml, sparse_molora.yaml
 scripts/           setup_env.sh, link_needle.py
-docs/              needle_environment.md, phase1_validation.md, phase2_validation.md, figures/
+docs/              needle_environment.md, phase1_validation.md, phase2_validation.md,
+                   phase3_design.md, phase3_validation.md, figures/
 ```
 
 ## Planned next steps
 
-Phase 3 adds sparse top-k routing on top of `DenseMoLoRALinear`: a
-differentiable top-k gate mask (a new project-side Needle `TensorOp`, since
-Needle has no top-k/indexing op), skipping unselected experts' computation,
-load-balance diagnostics and an optional auxiliary balance loss as a separate
-ablation, and a dense-vs-sparse cost comparison using
-`experiments/benchmark_dense_molora.py` as the reference. Dense routing is
-measured here to cost about 3.5–5× a single LoRA per step on CPU; no efficiency
-claim is made for it. Phase 4 (quantised frozen backbone) remains optional.
+Phase 4 (optional): a quantised frozen backbone in the spirit of QLoRA,
+implemented as a project-local dequantising weight op on top of the same
+`LoRALinear` / `DenseMoLoRALinear` / `SparseMoLoRALinear` layers. Open items
+carried over from Phase 3: a wider seed study of top-2 convergence failures and
+top-1 straight-through brittleness, an evaluation on a task without an explicit
+regime feature, and (only if CPU latency matters) a batched or fused expert path
+to move the sparse-vs-dense break-even point. No GPU results exist for any phase.
