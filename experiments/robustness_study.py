@@ -100,7 +100,8 @@ def grad_norms(model):
     return rn[0], en
 
 
-def train_one(name, spec, problem, cfg, seed, lr, balance_coef=0.0):
+def train_one(name, spec, problem, cfg, seed, lr, balance_coef=0.0, extra_eval=None):
+    """Train one method on one problem. ``extra_eval(model, problem) -> dict`` is merged into the record."""
     tr, dtype, R = cfg["training"], cfg["dtype"], cfg["data"]["n_regimes"]
     model = build_model(name, spec, problem, cfg, seed)
     params = model.trainable_parameters()
@@ -162,6 +163,8 @@ def train_one(name, spec, problem, cfg, seed, lr, balance_coef=0.0):
         rec["final_routing_test"] = routing_summary(model, test, R, dtype)
         D = model.expert_delta_weights()
         rec["expert_delta_norms"] = [float(np.linalg.norm(d)) for d in D]
+    if extra_eval is not None:
+        rec.update(extra_eval(model, problem))
     return rec
 
 

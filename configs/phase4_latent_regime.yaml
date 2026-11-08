@@ -1,0 +1,92 @@
+# Phase 4B — implicit regime discovery: the regime is a latent mixture component,
+# never an input feature. Protocol frozen before the confirmatory run.
+experiment:
+  name: phase4b_latent_regime
+  output_dir: outputs
+  seeds: [4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009]   # 10 per condition
+
+dtype: float32
+
+data:
+  input_dim: 128
+  output_dim: 128
+  n_regimes: 4
+  regime_rank: 8
+  delta_rel_norm: 0.5
+  noise_std: 0.0
+  sigma: 1.0
+  delta: 2.0            # overridden per condition below
+  n_train: 8192
+  n_val: 1024
+  n_test: 1024
+  bias: false
+
+# Separability conditions, defined by the pairwise Mahalanobis distance between
+# regime means (delta * sqrt(2) with sigma = 1), fixed BEFORE any model was run.
+conditions:
+  easy:   {delta: 4.0}   # pairwise distance 5.66 -> Bayes error ~ 1%
+  medium: {delta: 2.0}   # pairwise distance 2.83 -> Bayes error ~ 15-20%
+  hard:   {delta: 1.0}   # pairwise distance 1.41 -> Bayes error ~ 45-50% (chance 75%)
+
+ambiguity_threshold: 0.9   # a test point is "ambiguous" if max_z p(z|x) < 0.9 under the true model
+
+model:
+  n_experts: 4
+  rank: 8
+  alpha: 16.0
+  router_temperature: 1.0
+  router_init: xavier
+  b_init_std: 0.0
+  execution_mode: dispatch
+
+baselines:
+  single_lora_rank: 8
+  matched_lora_rank: 34
+
+# Primary sparse configuration chosen from Phase 4A (before any 4B run): sparse
+# top-2, exact gradient, no balance loss (0/30 failures, beat dense on 29/30).
+# Top-1 straight-through is kept as the brittleness comparison.
+methods:
+  frozen:          {kind: frozen}
+  single_lora:     {kind: lora, rank: 8}
+  matched_lora:    {kind: lora, rank: 34}
+  dense_molora:    {kind: dense}
+  sparse_top2:     {kind: sparse, top_k: 2, router_grad_mode: renormalized}
+  sparse_top1_ste: {kind: sparse, top_k: 1, router_grad_mode: straight_through}
+
+training:
+  optimizer: adam
+  batch_size: 32
+  max_steps: 2000
+  eval_every: 100
+  track_every: 100
+  # learning rates: validation-only pilot on seeds 3000-3001 over all three
+  # conditions (candidates below); filled in before the confirmatory run.
+  # Pilot result (outputs/phase4b_latent_regime_pilot/20261108-172448), geometric-mean
+  # validation MSE over 3 conditions x 2 seeds, lr 1e-3 vs 3e-3:
+  #   single_lora 0.446/0.449, matched_lora 0.387/0.388, dense 0.122/0.0757,
+  #   sparse_top2 0.126/0.0801, sparse_top1_ste 0.0987/0.114
+  learning_rate:
+    single_lora: 0.001
+    matched_lora: 0.001
+    dense_molora: 0.003
+    sparse_top2: 0.003
+    sparse_top1_ste: 0.001
+
+pilot:
+  seeds: [3000, 3001]
+  learning_rates: [0.001, 0.003]
+
+# Pre-registered failure criterion for this task family: validation MSE above
+# max(0.01, 2 x soft-Bayes-oracle validation MSE). The soft-Bayes oracle (true
+# posterior-weighted planted corrections, perfect experts) is the best any
+# x-only router could do, so 2x that bound (or the Phase 4A absolute 0.01,
+# whichever is larger) marks a run that did not learn the routing.
+failure:
+  val_mse_threshold: 0.01
+  oracle_multiplier: 2.0
+
+analysis:
+  n_bootstrap: 10000
+  bootstrap_seed: 0
+  alpha: 0.05
