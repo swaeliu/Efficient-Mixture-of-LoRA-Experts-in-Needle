@@ -19,6 +19,8 @@ Leading input dimensions are flattened to a token axis internally.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 import needle as ndl
@@ -27,10 +29,11 @@ from needle.autograd import Tensor
 from needle.nn import Parameter
 
 from .dense_molora import DenseMoLoRALinear
+from .ops.dispatch import gather_rows, scatter_add_rows
 from .ops.topk import TopKSelection, _validate_k
 from .sparse_router import ROUTER_GRAD_MODES, SparseTopKRouter
 
-__all__ = ["SparseMoLoRALinear", "EXECUTION_MODES"]
+__all__ = ["SparseMoLoRALinear", "EXECUTION_MODES", "load_balance_loss"]
 
 EXECUTION_MODES = ("reference", "dispatch")
 
@@ -60,6 +63,8 @@ class SparseMoLoRALinear(DenseMoLoRALinear):
         self.router.dense.weight = dense_router.weight  # keep the Parameter objects created by the parent
         self.router.dense.bias = dense_router.bias
         self.last_stats: dict | None = None  # plain numbers from the most recent forward (never tensors)
+        self.profile = False  # when True, forward() records wall-time per stage in self.last_timing
+        self.last_timing: dict | None = None
 
     # ------------------------------------------------------------------ #
     def router_parameters(self) -> list[Parameter]:
@@ -96,21 +101,68 @@ class SparseMoLoRALinear(DenseMoLoRALinear):
             out = out + ops.broadcast_to(w_i, dy_i.shape) * dy_i
         return out
 
-    def _dispatch_mix(self, x_flat: Tensor, out: Tensor, sel: TopKSelection, n_tokens: int) -> Tensor:
-        raise NotImplementedError("execution_mode='dispatch' is implemented in Phase 3B")
+    def _dispatch_mix(self, x_flat: Tensor, out: Tensor, sel: TopKSelection, n_tokens: int):
+        """Run each expert only on the tokens that selected it; scatter-add the weighted results.
+
+        Returns ``(out, executed_rows)`` where ``executed_rows[i]`` is the number of token
+        rows expert i actually processed (0 => its matmuls were skipped).
+        """
+        contribs, idx_list, executed = [], [], []
+        t_gather = t_expert = 0.0
+        for i, expert in enumerate(self.experts):
+            tok = np.flatnonzero(sel.mask[:, i])
+            if tok.size == 0:
+                executed.append(0)
+                continue  # inactive expert: no gather, no matmul
+            t0 = time.perf_counter() if self.profile else 0.0
+            x_i = gather_rows(x_flat, tok)  # (M_i, in)
+            w_i = gather_rows(sel.weights, tok) @ self._selectors[i]  # (M_i, 1) selected routing weights
+            if self.profile:
+                t1 = time.perf_counter()
+                t_gather += t1 - t0
+            dy_i = expert(x_i)  # (M_i, out): the only expert matmuls executed
+            if self.profile:
+                t2 = time.perf_counter()
+                t_expert += t2 - t1
+            contribs.append(ops.broadcast_to(w_i, dy_i.shape) * dy_i)
+            idx_list.append(tok)
+            executed.append(int(tok.size))
+        t0 = time.perf_counter() if self.profile else 0.0
+        if contribs:
+            out = out + scatter_add_rows(contribs, idx_list, n_tokens)
+        if self.profile:
+            self._timing_acc["dispatch_s"] += t_gather + (time.perf_counter() - t0)
+            self._timing_acc["expert_s"] += t_expert
+        return out, executed
 
     def forward_with_routing(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """Return ``(y, sparse_weights)``; ``sparse_weights`` has shape ``(..., E)`` and is graph-bearing."""
+        prof = self.profile
+        if prof:
+            self._timing_acc = {"backbone_s": 0.0, "router_s": 0.0, "expert_s": 0.0, "dispatch_s": 0.0}
+            t0 = time.perf_counter()
         x_flat, lead, n_tokens = self._flatten(x)
         out = self._base(x_flat)
+        if prof:
+            t1 = time.perf_counter()
+            self._timing_acc["backbone_s"] = t1 - t0
         sel = self.router.route(x_flat)
+        if prof:
+            t2 = time.perf_counter()
+            self._timing_acc["router_s"] = t2 - t1
         tokens_per_expert = sel.mask.sum(axis=0).astype(int).tolist()
         if self.execution_mode == "reference":
+            t3 = time.perf_counter() if prof else 0.0
             out = self._reference_mix(x_flat, out, sel)
+            if prof:
+                self._timing_acc["expert_s"] = time.perf_counter() - t3
             executed = [n_tokens] * self.n_experts
         else:
             out, executed = self._dispatch_mix(x_flat, out, sel, n_tokens)
         self.last_stats = self._make_stats(n_tokens, tokens_per_expert, executed)
+        if prof:
+            self._timing_acc["forward_total_s"] = time.perf_counter() - t0
+            self.last_timing = dict(self._timing_acc)
         if len(lead) != 1:
             out = ops.reshape(out, lead + (self.out_features,))
             weights = ops.reshape(sel.weights, lead + (self.n_experts,))
@@ -180,3 +232,21 @@ class SparseMoLoRALinear(DenseMoLoRALinear):
                 f"n_experts={self.n_experts}, top_k={self.top_k}, rank={self.rank}, alpha={self.alpha}, "
                 f"bias={self.bias is not None}, execution_mode={self.execution_mode!r}, "
                 f"router_grad_mode={self.router_grad_mode!r}, dtype={self.dtype})")
+
+
+def load_balance_loss(sel: TopKSelection) -> Tensor:
+    """Switch-Transformer style auxiliary balance loss ``E * sum_i f_i * P_i``.
+
+    ``f_i`` is the (constant) fraction of tokens that selected expert i and ``P_i``
+    the mean dense routing probability of expert i (differentiable). The loss is
+    minimised (value 1) when both are uniform. ``sel`` must come from a 2-D
+    (token-flattened) routing call. Optional; not used unless an experiment
+    enables it explicitly.
+    """
+    probs = sel.dense_probs
+    n_tokens, E = probs.shape
+    f = sel.mask.sum(axis=0) / (n_tokens * sel.mask.sum(axis=1)[0])  # fraction of assignments per expert
+    f_t = ndl.Tensor(f.astype(probs.numpy().dtype), device=probs.device, dtype=str(np.dtype(probs.numpy().dtype)),
+                     requires_grad=False)
+    P = ops.summation(probs, axes=(0,)) / n_tokens  # (E,)
+    return ops.summation(P * f_t) * E
