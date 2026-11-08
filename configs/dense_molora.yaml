@@ -1,0 +1,83 @@
+# Phase 2 heterogeneous synthetic routing benchmark (Tasks 2.7 - 2.10).
+#
+# Four input regimes, each with its own planted rank-8 correction dW_z on a
+# shared frozen W0. The regime is encoded in the last `indicator_dims` input
+# features as a one-hot vector; the remaining features are N(0, 1).
+#
+#   y = x (W0 + dW_z)          dW_z = c_z A_z* B_z*,  ||dW_z||_F = delta_rel_norm * ||W0||_F
+#
+# A single LINEAR adapter of any rank cannot represent an input-dependent
+# correction (only a per-regime bias through the indicator rows), so this task
+# separates "more capacity" from "input-dependent routing".
+experiment:
+  name: dense_molora_synthetic
+  output_dir: outputs
+  seeds: [42, 43, 44]
+  repeat_first_seed: true
+
+seed: 42
+device: cpu
+dtype: float32
+
+data:
+  input_dim: 128
+  output_dim: 128
+  n_regimes: 4
+  indicator_dims: 4            # last 4 input features carry the regime one-hot
+  regime_rank: 8               # rank of each dW_z
+  delta_rel_norm: 0.5
+  noise_std: 0.0
+  n_train: 8192
+  n_val: 1024                  # used for pilot selection and monitoring
+  n_test: 1024                 # touched only by the confirmatory run
+  bias: false
+
+# Method C (the method under test) and the baselines B/D that share its budget.
+model:
+  n_experts: 4
+  rank: 8
+  alpha: 16.0
+  router_type: linear_softmax
+  router_granularity: token
+  router_temperature: 1.0
+  router_init: xavier          # 'zeros' gives uniform gates at init
+  b_init_std: 0.0              # 0 = exact zero adapter contribution at init (default correctness baseline)
+
+baselines:
+  single_lora_rank: 8          # Baseline B
+  # Baseline D: rank chosen so r (in + out) is nearest to MoLoRA's trainable count
+  # 8708 / 256 = 34.02 -> rank 34 -> 8704 params (4 fewer than MoLoRA).
+  matched_lora_rank: 34
+
+training:
+  optimizer: adam
+  batch_size: 32
+  max_steps: 2000
+  eval_every: 100
+  # Learning rates chosen by the pilot sweep (seed 42, VALIDATION set only,
+  # candidates 1e-3 / 3e-3 / 1e-2; outputs/dense_molora_synthetic_pilot/20261108-155332):
+  #   single_lora  val MSE 0.4206 / 0.4242 / 0.4364  -> 1e-3
+  #   matched_lora val MSE 0.3678 / 0.3690 / 0.3870  -> 1e-3
+  #   dense_molora val MSE 6.93e-3 / 5.43e-4 / 2.03e-2 -> 3e-3
+  learning_rate:
+    single_lora: 0.001
+    matched_lora: 0.001
+    dense_molora: 0.003
+
+pilot:
+  learning_rates: [0.001, 0.003, 0.01]
+  seed: 42
+
+diagnostics:
+  routing_eval_samples: 1024   # validation samples used for routing stats
+  track_every: 100             # steps between router-grad-norm / entropy snapshots
+
+# Pre-registered, recorded before the confirmatory run.
+success_criteria:
+  # Dense MoLoRA must beat the parameter-matched single LoRA on held-out TEST
+  # MSE by at least this factor on every seed (ratio = molora / matched_lora).
+  max_test_mse_ratio_vs_matched_lora: 0.5
+  # and reduce test MSE vs the frozen backbone by at least 90% on every seed
+  max_test_mse_ratio_vs_frozen: 0.10
+  require_frozen_backbone_unchanged: true
+  reproducibility_rtol: 1.0e-6
