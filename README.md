@@ -27,7 +27,10 @@ budget, and at what computational cost? The planned comparison is
 | 1 | Native `LoRALinear`, forward/backward/freezing tests, synthetic low-rank benchmark | **complete** ([docs/phase1_validation.md](docs/phase1_validation.md)) |
 | 2 | Dense Mixture-of-LoRA (`DenseMoLoRALinear`, softmax router, heterogeneous routing benchmark, CPU overhead benchmark) | **complete** ([docs/phase2_validation.md](docs/phase2_validation.md)) |
 | 3 | Sparse top-k routing (`SparseMoLoRALinear`, reference + genuine token dispatch), straight-through top-1, sparse-vs-dense benchmark | **complete** ([docs/phase3_design.md](docs/phase3_design.md), [docs/phase3_validation.md](docs/phase3_validation.md)) |
-| 4 | Quantised frozen backbone (QLoRA-style), optional | planned |
+| 4A | 30-seed robustness study, failure diagnostics, balance-loss ablation | **complete** ([docs/phase4a_robustness.md](docs/phase4a_robustness.md)) |
+| 4B | Latent-regime benchmark (no regime indicator), easy/medium/hard separability | **complete** ([docs/phase4b_latent_regime.md](docs/phase4b_latent_regime.md)) |
+| 4C | Needle-native tiny transformer with LoRA / MoLoRA adapters, fine-tuning study, systems benchmark | **complete** ([docs/phase4c_transformer.md](docs/phase4c_transformer.md)); summary in [docs/phase4_summary.md](docs/phase4_summary.md) |
+| 5 | Quantised frozen backbone (QLoRA-style), optional | planned (not implemented) |
 
 Everything under "planned" does not exist in this repository yet.
 
@@ -147,7 +150,7 @@ python scripts/link_needle.py /path/to/needle/python
 
 ```bash
 source .venv/bin/activate
-python -m pytest            # 353 tests (79 Phase 1 + 97 Phase 2 + 177 Phase 3), < 1 s on CPU
+python -m pytest            # 384 tests (Phases 0-4), a few seconds on CPU
 python experiments/smoke_test.py
 ```
 
@@ -222,6 +225,29 @@ outputs/benchmark_dense_molora/<timestamp>/benchmark.{json,md}
 
 Measured results and figures are in [docs/phase2_validation.md](docs/phase2_validation.md).
 
+## Phase 4: robustness, latent regimes, transformer
+
+```bash
+# 4A robustness (30 seeds, balance ablation)
+python experiments/robustness_study.py pilot-balance && python experiments/robustness_study.py study && python experiments/robustness_study.py ablation
+python experiments/robustness_study.py analyze outputs/phase4a_robustness/<ts> --ablation-dir outputs/phase4a_robustness_balance_ablation/<ts>
+# 4B latent regimes (no regime feature; easy/medium/hard)
+python experiments/train_latent_regime.py pilot && python experiments/train_latent_regime.py study
+python experiments/train_latent_regime.py analyze outputs/phase4b_latent_regime/<ts>
+# 4C tiny Needle transformer (models/): pretrain, adapter fine-tuning study, systems benchmark
+python experiments/train_tiny_transformer.py pretrain && python experiments/train_tiny_transformer.py pilot && python experiments/train_tiny_transformer.py study
+python experiments/train_tiny_transformer.py analyze outputs/phase4c_transformer/study_<ts>
+python experiments/benchmark_transformer.py
+```
+
+`models/tiny_transformer.py` is a decoder-only transformer built from hw2 Needle
+ops only (one-hot embeddings, 4-D batched causal attention, LayerNorm via the
+2-D `LayerNorm1d`, SoftmaxLoss on reshaped logits); `models/transformer_adapters.py`
+injects `LoRALinear` / `DenseMoLoRALinear` / `SparseMoLoRALinear` into FFN (and
+optionally q/v) projections via `from_linear` and exposes adapter-only
+parameter lists. `molora/protocol.py` holds the stable seed derivation and the
+statistics (exact binomial CI, paired bootstrap) used by all Phase 4 studies.
+
 ## Running the Phase 3 sparse-vs-dense experiments
 
 ```bash
@@ -246,25 +272,26 @@ its router.
 ## Repository layout
 
 ```
-molora/            needle_compat.py (locates Needle), lora.py (LoRALinear),
+models/            tiny_transformer.py (Needle-native decoder-only transformer), transformer_adapters.py
+molora/            needle_compat.py (locates Needle), lora.py (LoRALinear), protocol.py (seeds, statistics),
                    router.py (DenseSoftmaxRouter, softmax), dense_molora.py (LoRAExpert, DenseMoLoRALinear),
                    sparse_router.py (SparseTopKRouter), sparse_molora.py (SparseMoLoRALinear, load_balance_loss),
                    ops/topk.py (top-k selection, sparse gates), ops/dispatch.py (gather_rows, scatter_add_rows)
-tests/             pytest suite (Phases 0-3)
+tests/             pytest suite (Phases 0-4)
 experiments/       smoke_test.py, train_synthetic.py, train_dense_molora.py, benchmark_dense_molora.py,
-                   train_sparse_molora.py, benchmark_sparse_molora.py
-configs/           lora_baseline.yaml, dense_molora.yaml, sparse_molora.yaml
+                   train_sparse_molora.py, benchmark_sparse_molora.py, robustness_study.py,
+                   latent_regime_dataset.py, train_latent_regime.py, sequence_task.py,
+                   train_tiny_transformer.py, benchmark_transformer.py
+configs/           lora_baseline.yaml, dense_molora.yaml, sparse_molora.yaml, phase4_*.yaml
 scripts/           setup_env.sh, link_needle.py
-docs/              needle_environment.md, phase1_validation.md, phase2_validation.md,
-                   phase3_design.md, phase3_validation.md, figures/
+docs/              needle_environment.md, phase{1,2,3}_validation.md, phase3_design.md,
+                   phase4a_robustness.md, phase4b_latent_regime.md, phase4c_transformer.md, phase4_summary.md, figures/
 ```
 
 ## Planned next steps
 
-Phase 4 (optional): a quantised frozen backbone in the spirit of QLoRA,
-implemented as a project-local dequantising weight op on top of the same
-`LoRALinear` / `DenseMoLoRALinear` / `SparseMoLoRALinear` layers. Open items
-carried over from Phase 3: a wider seed study of top-2 convergence failures and
-top-1 straight-through brittleness, an evaluation on a task without an explicit
-regime feature, and (only if CPU latency matters) a batched or fused expert path
-to move the sparse-vs-dense break-even point. No GPU results exist for any phase.
+Toward the final report: consolidate Phases 0–4 into the write-up using
+`docs/phase4_summary.md` as the findings table; optional follow-ups are q/v
+adapter insertion, a real-text corpus for the transformer, a fused expert path
+if CPU latency matters, and (Phase 5, optional) a quantised frozen backbone.
+No GPU results exist for any phase; QLoRA is not implemented.
