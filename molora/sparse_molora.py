@@ -138,6 +138,18 @@ class SparseMoLoRALinear(DenseMoLoRALinear):
 
     def forward_with_routing(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """Return ``(y, sparse_weights)``; ``sparse_weights`` has shape ``(..., E)`` and is graph-bearing."""
+        out, sel, lead = self._forward_core(x)
+        weights = sel.weights if len(lead) == 1 else ops.reshape(sel.weights, lead + (self.n_experts,))
+        return out, weights
+
+    def forward_with_selection(self, x: Tensor) -> tuple[Tensor, TopKSelection]:
+        """Return ``(y, selection)`` where ``selection`` is the token-flattened :class:`TopKSelection`
+        (graph-bearing weights and dense probabilities, NumPy indices and mask) -- e.g. for an
+        auxiliary balance loss. Nothing is cached on the module."""
+        out, sel, _ = self._forward_core(x)
+        return out, sel
+
+    def _forward_core(self, x: Tensor):
         prof = self.profile
         if prof:
             self._timing_acc = {"backbone_s": 0.0, "router_s": 0.0, "expert_s": 0.0, "dispatch_s": 0.0}
@@ -166,10 +178,7 @@ class SparseMoLoRALinear(DenseMoLoRALinear):
             self.last_timing = dict(self._timing_acc)
         if len(lead) != 1:
             out = ops.reshape(out, lead + (self.out_features,))
-            weights = ops.reshape(sel.weights, lead + (self.n_experts,))
-        else:
-            weights = sel.weights
-        return out, weights
+        return out, sel, lead
 
     def _make_stats(self, n_tokens: int, tokens_per_expert: list[int], executed_rows: list[int]) -> dict:
         """Expert-work accounting (expert matmuls only; backbone, router and dispatch excluded)."""
