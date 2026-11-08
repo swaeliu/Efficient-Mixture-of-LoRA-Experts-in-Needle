@@ -1,0 +1,75 @@
+# Phase 4C — tiny Needle transformer with LoRA / MoLoRA adapters on a latent-process sequence task.
+experiment:
+  name: phase4c_transformer
+  output_dir: outputs
+  seeds: [5000, 5001, 5002, 5003, 5004]   # adapter init + adaptation-data order; one shared pretrained backbone
+
+dtype: float32
+
+data:
+  vocab_size: 16
+  n_processes: 4
+  n_hot: 3              # peaked transitions: 3 likely next tokens per state
+  hot_mass: 0.85
+  shift_eps: 0.5        # adaptation processes P' = 0.5 P + 0.5 Q_k (process-specific shift)
+  seq_len: 32
+  n_train: 4096         # adaptation sequences
+  n_val: 512
+  n_test: 512
+  pretrain_n_train: 8192
+  process_seed: 123     # defines the processes P_k, Q_k
+  pretrain_data_seed: 7
+  adapt_data_seed: 11
+
+model:
+  d_model: 64
+  n_heads: 4
+  n_layers: 2
+  d_ff: 128
+  max_seq_len: 32
+  dropout: 0.0
+
+pretrain:
+  seed: 0
+  steps: 1500
+  batch_size: 32
+  learning_rate: 0.003
+
+adapters:
+  rank: 4
+  alpha: 8.0
+  n_experts: 4
+  top_k: 2
+  where: [ffn]          # fc1 and fc2 of every block
+  # parameter-matched single LoRA rank: MoLoRA trainable = 13840 -> 4 layers x r x 192 = 13840 -> r = 18 (13824)
+  matched_rank: 18
+
+methods:
+  frozen:          {kind: frozen}
+  single_lora:     {kind: lora, rank: 4}
+  matched_lora:    {kind: lora, rank: 18}
+  dense_molora:    {kind: dense}
+  sparse_top2:     {kind: sparse, top_k: 2, router_grad_mode: renormalized}
+  sparse_top1_ste: {kind: sparse, top_k: 1, router_grad_mode: straight_through}
+
+finetune:
+  steps: 800
+  batch_size: 32
+  eval_every: 100
+  # Pilot (seed 4999, outputs/phase4c_transformer/pilot_20261108-175547; rule = lowest
+  # VALIDATION CE; candidates 1e-3 / 3e-3): every method chose 3e-3.
+  learning_rate:
+    single_lora: 0.003
+    matched_lora: 0.003
+    dense_molora: 0.003
+    sparse_top2: 0.003
+    sparse_top1_ste: 0.003
+
+pilot:
+  seed: 4999
+  learning_rates: [0.001, 0.003]
+
+analysis:
+  n_bootstrap: 10000
+  bootstrap_seed: 0
+  alpha: 0.05
