@@ -18,6 +18,9 @@ from .lora import (  # noqa: E402
 )
 from .router import DenseSoftmaxRouter, softmax  # noqa: E402
 from .dense_molora import DenseMoLoRALinear, LoRAExpert  # noqa: E402
+from . import ops  # noqa: E402
+from .sparse_router import SparseTopKRouter  # noqa: E402
+from .sparse_molora import SparseMoLoRALinear  # noqa: E402
 
 __version__ = "0.1.0"
 __all__ = [
@@ -25,6 +28,9 @@ __all__ = [
     "LoRAExpert",
     "DenseMoLoRALinear",
     "DenseSoftmaxRouter",
+    "SparseTopKRouter",
+    "SparseMoLoRALinear",
+    "ops",
     "softmax",
     "count_parameters",
     "freeze_module",
